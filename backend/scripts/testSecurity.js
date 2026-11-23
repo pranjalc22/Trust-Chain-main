@@ -1,0 +1,50 @@
+process.env.DATABASE_URL='sqlite::memory:';
+process.env.JWT_SECRET='test-secret-with-at-least-24-characters';
+const assert=require('node:assert/strict');
+const {Wallet}=require('ethers');
+const jwt=require('jsonwebtoken');
+const {sequelize}=require('../models');
+const service=require('../blockchain/contractService');
+const app=require('../app');
+(async()=>{
+ await sequelize.sync({force:true});
+ const [buyer,seller,stranger]=Array.from({length:3},()=>Wallet.createRandom().address.toLowerCase());
+ let status='Created';
+ service.getOnChainTransaction=async()=>({buyer,seller,amount:'1',status});
+ service.escrowContract={arbitrator:async()=>stranger};
+ const server=app.listen(0,'127.0.0.1');
+ await new Promise(r=>server.on('listening',r));
+ const call=async(method,path,body,wallet=buyer)=>{
+  const res=await fetch(`http://127.0.0.1:${server.address().port}/api${path}`,{method,headers:{'Content-Type':'application/json',Authorization:`Bearer ${jwt.sign({wallet_address:wallet},process.env.JWT_SECRET)}`},body:body?JSON.stringify(body):undefined});
+  return {status:res.status,body:await res.json()};
+ };
+ try {
+  assert.equal((await call('POST','/demo/reset')).status,410);
+  const data={seller_wallet:seller,amount:'999',description:'Verified escrow',on_chain_tx_id:'0',status:'Completed'};
+  const created=await call('POST','/transactions',data);
+  assert.equal(created.status,201); assert.equal(created.body.transaction.status,'Created'); assert.equal(created.body.transaction.amount,'1');
+  const id=created.body.transaction.id;
+  assert.equal((await call('POST','/transactions',data,stranger)).status,403);
+  assert.equal((await call('PATCH',`/transactions/${id}/status`,{status:'Completed'},stranger)).status,403);
+  assert.equal((await call('PATCH',`/transactions/${id}/status`,{status:'Completed'})).status,409);
+  assert.equal((await call('POST','/disputes',{transaction_id:id,evidence_buyer:'forged'},stranger)).status,403);
+  assert.equal((await call('POST','/disputes',{transaction_id:id,evidence_seller:'forged'})).status,403);
+  assert.equal((await call('POST','/disputes',{transaction_id:id,evidence_buyer:'claim'})).status,409);
+  status='Disputed';
+  const dispute=await call('POST','/disputes',{transaction_id:id,evidence_buyer:'claim'});
+  assert.equal(dispute.status,201);
+  const path=`/disputes/${dispute.body.dispute.id}/resolve`;
+  assert.equal((await call('PATCH',path,{outcome:'Resolved_Buyer'})).status,403);
+  assert.equal((await call('PATCH',path,{outcome:'Resolved_Buyer'},stranger)).status,409);
+  status='Refunded';
+  assert.equal((await call('PATCH',path,{outcome:'Resolved_Buyer'},stranger)).status,200);
+  const wallet=Wallet.createRandom();
+  const nonce=await call('POST','/auth/nonce',{wallet_address:wallet.address});
+  const repeat=await call('POST','/auth/nonce',{wallet_address:wallet.address});
+  assert.equal(nonce.body.nonce,repeat.body.nonce);
+  const signature=await wallet.signMessage(nonce.body.message);
+  assert.equal((await call('POST','/auth/verify',{wallet_address:wallet.address,signature})).status,200);
+  assert.equal((await call('POST','/auth/verify',{wallet_address:wallet.address,signature})).status,400);
+  console.log('16 security and synchronization assertions passed');
+ }finally{await new Promise(r=>server.close(r));await sequelize.close();}
+})().catch(e=>{console.error(e);process.exitCode=1;});
